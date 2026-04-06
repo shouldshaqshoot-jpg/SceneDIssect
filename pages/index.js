@@ -2,7 +2,6 @@ import { useState, useRef, useCallback } from "react";
 
 const DRIVE_ROOT = "Shot Lists — SceneDissect";
 const LIBRARY_FOLDER = "Shot Library";
-const SHEET_NAME = "Shot List Repository";
 const SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets";
 
 export default function SceneDissect() {
@@ -24,9 +23,9 @@ export default function SceneDissect() {
   const [showGuide, setShowGuide] = useState(false);
   const [creator, setCreator] = useState("");
   const [notes, setNotes] = useState("");
-  const [exportStatus, setExportStatus] = useState(null);
   const [libraryStatus, setLibraryStatus] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [showDriveWarning, setShowDriveWarning] = useState(false);
   const inputRef = useRef();
   const canvasRef = useRef();
   const shotsRef = useRef([]);
@@ -35,7 +34,6 @@ export default function SceneDissect() {
   const getCutThreshold = (sc) => Math.round(35 - (sc-1)*(27/9));
   const getDupThreshold = (sc) => Math.round(30 - (sc-1)*(10/9));
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
   const signIn = () => {
     if (!clientId.trim()) { alert("Paste your Google Client ID first."); return; }
     localStorage.setItem("sd_cid", clientId.trim());
@@ -61,7 +59,6 @@ export default function SceneDissect() {
     if (saved && !clientId) setTimeout(()=>setClientId(saved),0);
   }
 
-  // ── Video load ────────────────────────────────────────────────────────────
   const loadVideo = useCallback((file) => {
     if (!file?.type.startsWith("video/")) return;
     setVideoFile(file); videoFileRef.current = file;
@@ -70,13 +67,12 @@ export default function SceneDissect() {
     setScenes([]); setShots([]); shotsRef.current = [];
     setSelected(new Set());
     setError(null); setPhase("idle"); setProgress(0);
-    setExportStatus(null); setLibraryStatus(null); setUploadProgress(null);
+    setLibraryStatus(null); setUploadProgress(null);
     setCreator(file.name.replace(/\.[^.]+$/,"").replace(/[_-]/g," "));
     const tmp = document.createElement("video"); tmp.src = url;
     tmp.onloadedmetadata = () => { if (tmp.videoWidth && tmp.videoHeight) setVideoAspect(tmp.videoWidth/tmp.videoHeight); };
   }, []);
 
-  // ── Scene detection ───────────────────────────────────────────────────────
   function frameDiff(ctx,w,h,prev) {
     const curr = ctx.getImageData(0,0,w,h).data;
     if (!prev) return {diff:0,data:curr};
@@ -113,10 +109,15 @@ export default function SceneDissect() {
     });
   }
 
-  // ── Run analysis ──────────────────────────────────────────────────────────
   const run = async () => {
+    if (!token) { setShowDriveWarning(true); return; }
+    await startAnalysis();
+  };
+
+  const startAnalysis = async () => {
+    setShowDriveWarning(false);
     setError(null);setShots([]);setScenes([]);shotsRef.current=[];
-    setSelected(new Set());setExportStatus(null);setLibraryStatus(null);setUploadProgress(null);
+    setSelected(new Set());setLibraryStatus(null);setUploadProgress(null);
     setPhase("detecting");setProgress(0);setStatusMsg("Scanning for scene cuts…");
     let extracted;
     try { extracted=await extractScenes(videoFile,getCutThreshold(shotCount),getDupThreshold(shotCount),p=>{setProgress(p);setStatusMsg(`Scanning… ${p}%`);}); }
@@ -134,15 +135,13 @@ export default function SceneDissect() {
       }catch{results.push({shotNumber:i+1,time:extracted[i].time,dataUrl:extracted[i].dataUrl,shotType:"Error",angle:"—",cameraMovement:"—",lighting:"Failed.",composition:"—",mood:"—",lensEstimate:"—",shootFor:"Re-run."});}
       setShots([...results]);shotsRef.current=[...results];
     }
-    setProgress(100);setPhase("done");setStatusMsg(`${results.length} shots — select cards to save to library`);
+    setProgress(100);setPhase("done");setStatusMsg(`${results.length} shots — click cards to select`);
   };
 
-  // ── Card selection ────────────────────────────────────────────────────────
   const toggleCard = (i) => setSelected(prev=>{const n=new Set(prev);n.has(i)?n.delete(i):n.add(i);return n;});
   const selectAll = () => setSelected(new Set(shots.map((_,i)=>i)));
   const clearAll = () => setSelected(new Set());
 
-  // ── Drive helpers ─────────────────────────────────────────────────────────
   const gFetch = (url,opts={}) => fetch(url,{...opts,headers:{Authorization:"Bearer "+token,"Content-Type":"application/json",...(opts.headers||{})}});
 
   const getOrCreateFolder = async (name, parentId=null) => {
@@ -157,102 +156,72 @@ export default function SceneDissect() {
     return (await c.json()).id;
   };
 
-  const uploadBlob = async (folderId, filename, blob, mimeType="application/octet-stream") => {
+  const uploadBlob = async (folderId, filename, data, mimeType="application/json") => {
+    const blob = new Blob([data],{type:mimeType});
     const meta = JSON.stringify({name:filename,parents:[folderId]});
     const body = new FormData();
     body.append("metadata",new Blob([meta],{type:"application/json"}));
-    body.append("file",new Blob([blob],{type:mimeType}),filename);
+    body.append("file",blob,filename);
     const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink",{method:"POST",headers:{Authorization:"Bearer "+token},body});
     return r.json();
   };
 
-  const uploadVideoFile = async (folderId, file, onProgress) => {
-    // Resumable upload for large files
+  const uploadVideoResumable = async (folderId, file, onProgress) => {
     const initRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,webViewLink",{
       method:"POST",
       headers:{Authorization:"Bearer "+token,"Content-Type":"application/json","X-Upload-Content-Type":file.type,"X-Upload-Content-Length":file.size},
       body:JSON.stringify({name:file.name,parents:[folderId]})
     });
     const uploadUrl = initRes.headers.get("Location");
-    const chunkSize = 5*1024*1024; // 5MB chunks
-    let start = 0;
-    let fileId = null, webViewLink = null;
-    while(start < file.size) {
-      const end = Math.min(start+chunkSize, file.size);
-      const chunk = file.slice(start, end);
-      const res = await fetch(uploadUrl,{
-        method:"PUT",
-        headers:{"Content-Range":`bytes ${start}-${end-1}/${file.size}`,"Content-Type":file.type},
-        body:chunk
-      });
-      start = end;
+    const chunkSize = 5*1024*1024;
+    let start=0,fileId=null,webViewLink=null;
+    while(start<file.size){
+      const end=Math.min(start+chunkSize,file.size);
+      const chunk=file.slice(start,end);
+      const res=await fetch(uploadUrl,{method:"PUT",headers:{"Content-Range":`bytes ${start}-${end-1}/${file.size}`,"Content-Type":file.type},body:chunk});
+      start=end;
       if(onProgress) onProgress(Math.round(start/file.size*100));
       if(res.status===200||res.status===201){const d=await res.json();fileId=d.id;webViewLink=d.webViewLink;}
     }
     return {id:fileId,webViewLink};
   };
 
-  // ── Save to Library ───────────────────────────────────────────────────────
   const saveToLibrary = async () => {
-    if (!token) { alert("Connect Google Drive first."); return; }
-    if (selected.size === 0) { alert("Select at least one shotcard first."); return; }
-    setLibraryStatus({type:"loading",msg:"Uploading video to Drive…"});
-    setUploadProgress(0);
-    try {
-      // 1. Get/create folders
-      const rootId = await getOrCreateFolder(DRIVE_ROOT);
-      const libId = await getOrCreateFolder(LIBRARY_FOLDER, rootId);
-      // Create a per-video subfolder inside the library
-      const date = new Date().toISOString().slice(0,10);
-      const videoFolderName = `${creator||"video"} — ${date}`;
-      const videoFolderId = await getOrCreateFolder(videoFolderName, libId);
-
-      // 2. Upload the video file
+    if(!token){alert("Connect Google Drive first.");return;}
+    if(selected.size===0){alert("Select at least one shotcard.");return;}
+    setLibraryStatus({type:"loading",msg:"Setting up Drive folders…"});setUploadProgress(0);
+    try{
+      const rootId=await getOrCreateFolder(DRIVE_ROOT);
+      const libId=await getOrCreateFolder(LIBRARY_FOLDER,rootId);
+      const date=new Date().toISOString().slice(0,10);
+      const vFolderName=`${creator||"video"} — ${date}`;
+      const vFolderId=await getOrCreateFolder(vFolderName,libId);
       setLibraryStatus({type:"loading",msg:"Uploading source video…"});
-      const videoFile_ = videoFileRef.current;
-      const vidResult = await uploadVideoFile(videoFolderId, videoFile_, (pct) => {
-        setUploadProgress(pct);
-        setLibraryStatus({type:"loading",msg:`Uploading video… ${pct}%`});
+      const vidResult=await uploadVideoResumable(vFolderId,videoFileRef.current,(pct)=>{
+        setUploadProgress(pct);setLibraryStatus({type:"loading",msg:`Uploading video… ${pct}%`});
       });
-      const videoLink = vidResult.webViewLink || "";
-
-      // 3. Save each selected card as a JSON file
-      setLibraryStatus({type:"loading",msg:`Saving ${selected.size} shotcard${selected.size>1?"s":""}…`});
-      const selectedShots = [...selected].map(i => shotsRef.current[i]);
-      for (const shot of selectedShots) {
-        const cardData = {
-          id: `${(creator||"video").replace(/\s+/g,"_")}_shot${String(shot.shotNumber).padStart(2,"0")}_${date}_${Date.now()}`,
-          savedAt: new Date().toISOString(),
-          sourceVideo: creator || videoFile_?.name || "Unknown",
-          sourceVideoLink: videoLink,
-          videoFolderLink: `https://drive.google.com/drive/folders/${videoFolderId}`,
-          shotNumber: shot.shotNumber,
-          time: shot.time,
-          dataUrl: shot.dataUrl,
-          shotType: shot.shotType || "—",
-          angle: shot.angle || "—",
-          cameraMovement: shot.cameraMovement || "—",
-          lensEstimate: shot.lensEstimate || "—",
-          lighting: shot.lighting || "—",
-          composition: shot.composition || "—",
-          mood: shot.mood || "—",
-          shootFor: shot.shootFor || "—",
-          userNotes: "",
+      const videoLink=vidResult.webViewLink||"";
+      setLibraryStatus({type:"loading",msg:`Saving ${selected.size} card${selected.size>1?"s":""}…`});
+      const selectedShots=[...selected].map(i=>shotsRef.current[i]);
+      for(const shot of selectedShots){
+        const card={
+          id:`${(creator||"video").replace(/\s+/g,"_")}_shot${String(shot.shotNumber).padStart(2,"0")}_${date}_${Date.now()}`,
+          savedAt:new Date().toISOString(),
+          sourceVideo:creator||videoFileRef.current?.name||"Unknown",
+          sourceVideoLink:videoLink,
+          videoFolderLink:`https://drive.google.com/drive/folders/${vFolderId}`,
+          shotNumber:shot.shotNumber,time:shot.time,dataUrl:shot.dataUrl,
+          shotType:shot.shotType||"—",angle:shot.angle||"—",cameraMovement:shot.cameraMovement||"—",
+          lensEstimate:shot.lensEstimate||"—",lighting:shot.lighting||"—",
+          composition:shot.composition||"—",mood:shot.mood||"—",shootFor:shot.shootFor||"—",userNotes:"",
         };
-        const filename = `${cardData.id}.json`;
-        const jsonBlob = JSON.stringify(cardData);
-        await uploadBlob(videoFolderId, filename, jsonBlob, "application/json");
+        await uploadBlob(vFolderId,`${card.id}.json`,JSON.stringify(card));
       }
-
       setLibraryStatus({type:"success",msg:`${selected.size} card${selected.size>1?"s":""} saved to library ✓`});
       setUploadProgress(null);
-    } catch(e) {
-      setLibraryStatus({type:"error",msg:"Save failed: "+e.message});
-      setUploadProgress(null);
-    }
+    }catch(e){setLibraryStatus({type:"error",msg:"Save failed: "+e.message});setUploadProgress(null);}
   };
 
-  // ── PDF export ────────────────────────────────────────────────────────────
   const loadJsPDF = () => new Promise((res,rej)=>{
     if(window.jspdf){res();return;}
     const s=document.createElement("script");s.src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";s.onload=res;s.onerror=rej;document.head.appendChild(s);
@@ -297,166 +266,204 @@ export default function SceneDissect() {
   const sliderHint = shotCount<=3?"Major scene changes only":shotCount<=5?"Hard cuts and clear transitions":shotCount<=7?"Most visible cuts":shotCount<=8?"Subtle cuts included":"Every distinct frame change";
 
   const C = {
-    bg:"#070707",surface:"#0d0d0d",surface2:"#111",border:"#1a1a1a",border2:"#222",
-    text:"#f0ede8",textSub:"#c8c4bc",textDim:"#666",
-    accent:"#e8ff47",accentDim:"rgba(232,255,71,0.07)",accentBorder:"rgba(232,255,71,0.18)",
-    green:"#22c55e",greenDim:"rgba(34,197,94,0.07)",greenBorder:"rgba(34,197,94,0.2)",
+    bg:"#070707", surface:"#0d0d0d", surface2:"#141414", border:"#1e1e1e", border2:"#2a2a2a",
+    text:"#f0ede8", textSub:"#c8c4bc", textDim:"#777",
+    accent:"#e8ff47", accentDim:"rgba(232,255,71,0.07)", accentBorder:"rgba(232,255,71,0.2)",
+    green:"#22c55e", greenDim:"rgba(34,197,94,0.08)", greenBorder:"rgba(34,197,94,0.25)",
     red:"#dc2626",
   };
+
+  const label = (txt) => ({fontSize:11,letterSpacing:"0.12em",textTransform:"uppercase",color:C.textDim,marginBottom:8,display:"block",fontWeight:600});
+  const fieldStyle = {width:"100%",background:C.surface2,border:`1px solid ${C.border2}`,borderRadius:4,padding:"10px 12px",fontFamily:"'Courier New',monospace",fontSize:12,color:C.text,outline:"none"};
 
   return (
     <>
       <style>{`
         *{box-sizing:border-box;margin:0;padding:0}
         html,body{height:100%;background:${C.bg}}
-        ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:2px}
-        input[type=range]{-webkit-appearance:none;height:3px;border-radius:2px;background:#2a2a2a;outline:none;cursor:pointer;width:100%}
-        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:${C.accent};cursor:pointer}
+        ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:3px}
+        input[type=range]{-webkit-appearance:none;height:4px;border-radius:2px;background:#2a2a2a;outline:none;cursor:pointer;width:100%}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:${C.accent};cursor:pointer}
         input[type=range]:disabled{opacity:0.35}
         .hbtn{transition:opacity 0.15s;cursor:pointer}.hbtn:hover:not(:disabled){opacity:0.78}
-        .drop-hover:hover{border-color:${C.accent}!important;background:${C.accentDim}!important}
-        .card-sel{outline:2px solid ${C.accent};outline-offset:2px}
+        .drop-hover:hover{border-color:${C.accent}!important;background:rgba(232,255,71,0.04)!important}
+        .card-hover:hover .chk-reveal{opacity:1!important}
         .shot-card{animation:slideIn 0.28s ease forwards;opacity:0}
-        @keyframes slideIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes slideIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
         @keyframes pulse{0%,100%{opacity:0.2;transform:scale(0.7)}50%{opacity:1;transform:scale(1)}}
-        .card-hover:hover .card-check{opacity:1!important}
+        input:focus{border-color:${C.accent}!important}
       `}</style>
       <canvas ref={canvasRef} style={{display:"none"}} />
 
       <div style={{display:"flex",flexDirection:"column",height:"100vh",overflow:"hidden",fontFamily:"'Courier New',monospace",background:C.bg,color:C.text}}>
 
-        {/* Top bar */}
-        <div style={{height:46,borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 20px",flexShrink:0,background:C.surface}}>
-          <div style={{display:"flex",alignItems:"center",gap:14}}>
-            <div style={{display:"flex",alignItems:"center",gap:7}}>
-              <div style={{width:7,height:7,borderRadius:"50%",background:C.accent,boxShadow:"0 0 8px rgba(232,255,71,0.4)"}} />
-              <span style={{fontSize:11,fontWeight:700,letterSpacing:"0.14em",textTransform:"uppercase",color:C.text}}>SceneDissect</span>
+        {/* ── Top bar ── */}
+        <div style={{height:52,borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 24px",flexShrink:0,background:C.surface}}>
+          <div style={{display:"flex",alignItems:"center",gap:16}}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:C.accent,boxShadow:"0 0 10px rgba(232,255,71,0.5)"}} />
+              <span style={{fontSize:13,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:C.text}}>SceneDissect</span>
             </div>
-            <div style={{width:1,height:14,background:C.border2}} />
-            <a href="/library" style={{fontSize:9,letterSpacing:"0.12em",textTransform:"uppercase",color:C.textDim,textDecoration:"none",padding:"3px 8px",border:`1px solid ${C.border2}`,borderRadius:3,transition:"color 0.15s"}}
+            <div style={{width:1,height:16,background:C.border2}} />
+            <a href="/library" style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",color:C.textDim,textDecoration:"none",padding:"4px 10px",border:`1px solid ${C.border2}`,borderRadius:4,transition:"color 0.15s"}}
               onMouseEnter={e=>e.target.style.color=C.accent} onMouseLeave={e=>e.target.style.color=C.textDim}>
               Shot Library →
             </a>
           </div>
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            {isDone && shots.length>0 && <>
-              <button className="hbtn" style={{padding:"5px 14px",fontSize:9,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",borderRadius:3,border:`1px solid ${C.accentBorder}`,background:C.accentDim,color:C.accent}} onClick={exportPDF}>↓ Export PDF</button>
-              <div style={{width:1,height:14,background:C.border2}} />
-            </>}
-            <button className="hbtn" onClick={()=>setShowAuth(a=>!a)} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 12px",background:"transparent",border:`1px solid ${C.border2}`,borderRadius:3}}>
-              <div style={{width:6,height:6,borderRadius:"50%",background:token?C.green:C.border2,boxShadow:token?"0 0 6px rgba(34,197,94,0.5)":"none"}} />
-              <span style={{fontSize:9,color:token?C.green:C.textDim,letterSpacing:"0.06em"}}>{token?userEmail||"Drive Connected":"Connect Drive"}</span>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            {isDone && shots.length>0 && (
+              <button className="hbtn" style={{padding:"7px 16px",fontSize:11,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",borderRadius:4,border:`1px solid ${C.accentBorder}`,background:C.accentDim,color:C.accent}} onClick={exportPDF}>↓ Export PDF</button>
+            )}
+            <button className="hbtn" onClick={()=>setShowAuth(a=>!a)} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 14px",background:"transparent",border:`1px solid ${C.border2}`,borderRadius:4}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:token?C.green:C.border2,boxShadow:token?"0 0 6px rgba(34,197,94,0.5)":"none"}} />
+              <span style={{fontSize:11,color:token?C.green:C.textDim}}>{token?userEmail||"Drive Connected":"Connect Drive"}</span>
             </button>
           </div>
         </div>
 
-        {/* Auth dropdown */}
-        {showAuth && (
-          <div style={{position:"absolute",top:46,right:16,zIndex:200,background:"#111",border:`1px solid ${C.border2}`,borderRadius:6,padding:16,width:272,boxShadow:"0 12px 32px rgba(0,0,0,0.8)"}}>
-            <div style={{fontSize:9,letterSpacing:"0.15em",textTransform:"uppercase",color:C.textDim,marginBottom:10}}>Google Drive</div>
-            {!token?<>
-              <input style={{width:"100%",background:C.surface2,border:`1px solid ${C.border2}`,borderRadius:3,padding:"6px 8px",fontFamily:"'Courier New',monospace",fontSize:9,color:C.textSub,outline:"none",marginBottom:8}} placeholder="Paste Google Client ID…" value={clientId} onChange={e=>setClientId(e.target.value)} />
-              <button className="hbtn" style={{width:"100%",padding:"8px",fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",borderRadius:3,border:"none",background:C.accent,color:"#080808",marginBottom:8}} onClick={signIn}>Connect</button>
-              <button style={{fontSize:9,color:C.accent,background:"none",border:"none",cursor:"pointer",padding:0,letterSpacing:"0.08em",textTransform:"uppercase"}} onClick={()=>setShowGuide(g=>!g)}>{showGuide?"▲":"▼"} Setup guide</button>
-              {showGuide&&<div style={{marginTop:10,borderTop:`1px solid ${C.border}`,paddingTop:10}}>
-                {["Go to console.cloud.google.com → new project","Enable Google Drive API + Sheets API","Credentials → OAuth 2.0 Client ID → Web App","Add your Vercel URL to origins + redirect URIs","Paste Client ID above → Connect","OAuth Consent → Audience → add your Gmail"].map((t,i)=>(
-                  <div key={i} style={{display:"flex",gap:7,marginBottom:5}}>
-                    <span style={{fontSize:9,color:C.accent,flexShrink:0}}>{i+1}.</span>
-                    <span style={{fontSize:9,color:C.textSub,lineHeight:1.5}}>{t}</span>
-                  </div>
-                ))}
-              </div>}
-            </>:<button className="hbtn" style={{width:"100%",padding:"8px",fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",borderRadius:3,border:`1px solid ${C.border2}`,background:"transparent",color:C.textSub}} onClick={()=>{setToken(null);setUserEmail("");setShowAuth(false);}}>Disconnect</button>}
+        {/* ── Drive warning modal ── */}
+        {showDriveWarning && (
+          <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+            <div style={{background:"#0f0f0f",border:"1px solid #2a2a2a",borderRadius:10,padding:32,maxWidth:420,width:"100%",textAlign:"center"}}>
+              <div style={{fontSize:36,marginBottom:16}}>⚠️</div>
+              <div style={{fontSize:16,fontWeight:700,color:"#f0ede8",marginBottom:10}}>Google Drive not connected</div>
+              <div style={{fontSize:13,color:"#888",lineHeight:1.7,marginBottom:24}}>
+                Your shots won't be saved to Drive after analysis.<br/>
+                If you close or refresh, your progress will be lost.<br/>
+                <strong style={{color:"#c8c4bc"}}>Connect Drive first to save your shotcards to the library.</strong>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                <button style={{width:"100%",padding:"12px",fontSize:13,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",borderRadius:6,border:"none",background:"#e8ff47",color:"#080808",cursor:"pointer"}}
+                  onClick={()=>{setShowDriveWarning(false);setShowAuth(true);}}>
+                  Connect Drive First
+                </button>
+                <button style={{width:"100%",padding:"12px",fontSize:12,fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase",borderRadius:6,border:"1px solid #2a2a2a",background:"transparent",color:"#666",cursor:"pointer"}}
+                  onClick={startAnalysis}>
+                  Continue Without Drive
+                </button>
+                <button style={{fontSize:11,color:"#444",background:"none",border:"none",cursor:"pointer",padding:"4px"}}
+                  onClick={()=>setShowDriveWarning(false)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
+        {/* ── Auth dropdown ── */}
+        {showAuth && (
+          <div style={{position:"absolute",top:52,right:16,zIndex:200,background:"#111",border:`1px solid ${C.border2}`,borderRadius:8,padding:20,width:300,boxShadow:"0 16px 48px rgba(0,0,0,0.8)"}}>
+            <div style={{fontSize:11,letterSpacing:"0.12em",textTransform:"uppercase",color:C.textDim,marginBottom:12}}>Google Drive</div>
+            {!token ? <>
+              <input style={{...fieldStyle,marginBottom:10,fontSize:11}} placeholder="Paste Google Client ID…" value={clientId} onChange={e=>setClientId(e.target.value)} />
+              <button className="hbtn" style={{width:"100%",padding:"10px",fontSize:12,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",borderRadius:4,border:"none",background:C.accent,color:"#080808",marginBottom:10}} onClick={signIn}>Connect</button>
+              <button style={{fontSize:11,color:C.accent,background:"none",border:"none",cursor:"pointer",padding:0,letterSpacing:"0.06em",textTransform:"uppercase"}} onClick={()=>setShowGuide(g=>!g)}>{showGuide?"▲":"▼"} Setup guide</button>
+              {showGuide && <div style={{marginTop:12,borderTop:`1px solid ${C.border}`,paddingTop:12}}>
+                {["Go to console.cloud.google.com → new project","Enable Google Drive API + Sheets API","Credentials → OAuth 2.0 Client ID → Web App","Add your Vercel URL to origins + redirect URIs","Paste Client ID above → Connect","OAuth Consent → Audience → add your Gmail"].map((t,i)=>(
+                  <div key={i} style={{display:"flex",gap:10,marginBottom:8}}>
+                    <span style={{fontSize:11,color:C.accent,flexShrink:0}}>{i+1}.</span>
+                    <span style={{fontSize:11,color:C.textSub,lineHeight:1.5}}>{t}</span>
+                  </div>
+                ))}
+              </div>}
+            </> : (
+              <button className="hbtn" style={{width:"100%",padding:"10px",fontSize:12,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",borderRadius:4,border:`1px solid ${C.border2}`,background:"transparent",color:C.textSub}} onClick={()=>{setToken(null);setUserEmail("");setShowAuth(false);}}>Disconnect</button>
+            )}
+          </div>
+        )}
+
+        {/* ── Main layout ── */}
         <div style={{display:"flex",flex:1,overflow:"hidden"}}>
 
-          {/* LEFT */}
-          <div style={{width:290,flexShrink:0,borderRight:`1px solid ${C.border}`,display:"flex",flexDirection:"column",overflow:"hidden",background:C.surface}}>
+          {/* ── LEFT PANEL — wider, more breathing room ── */}
+          <div style={{width:360,flexShrink:0,borderRight:`1px solid ${C.border}`,display:"flex",flexDirection:"column",overflow:"hidden",background:C.surface}}>
 
-            {!videoFile?(
-              <div className="drop-hover" style={{margin:12,border:`1px dashed ${C.border2}`,borderRadius:5,height:190,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.2s"}}
+            {/* Video area */}
+            {!videoFile ? (
+              <div className="drop-hover"
+                style={{margin:16,border:`2px dashed ${C.border2}`,borderRadius:8,minHeight:220,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.2s",gap:8}}
                 onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();loadVideo(e.dataTransfer.files[0]);}} onClick={()=>inputRef.current?.click()}>
                 <input ref={inputRef} type="file" accept="video/*" style={{display:"none"}} onChange={e=>loadVideo(e.target.files[0])} />
-                <div style={{fontSize:28,marginBottom:8}}>🎞</div>
-                <div style={{fontSize:11,color:C.text,fontWeight:700,marginBottom:3}}>Drop video here</div>
-                <div style={{fontSize:9,color:C.textDim,letterSpacing:"0.06em"}}>MP4 · MOV · WEBM</div>
+                <div style={{fontSize:36,opacity:0.5}}>🎞</div>
+                <div style={{fontSize:14,color:C.text,fontWeight:700}}>Drop video here</div>
+                <div style={{fontSize:12,color:C.textDim}}>or click to browse</div>
+                <div style={{fontSize:11,color:C.textDim,marginTop:4}}>MP4 · MOV · WEBM</div>
               </div>
-            ):(
+            ) : (
               <>
-                <div style={{background:"#000",display:"flex",alignItems:"center",justifyContent:"center",height:isPortrait?280:170,flexShrink:0,overflow:"hidden"}}>
-                  <video src={videoURL} controls playsInline style={{maxWidth:"100%",maxHeight:isPortrait?280:170,width:"auto",height:"auto",display:"block"}} />
+                <div style={{background:"#000",display:"flex",alignItems:"center",justifyContent:"center",minHeight:isPortrait?320:200,flexShrink:0,overflow:"hidden"}}>
+                  <video src={videoURL} controls playsInline style={{maxWidth:"100%",maxHeight:isPortrait?320:200,width:"auto",height:"auto",display:"block"}} />
                 </div>
-                <div style={{padding:"6px 12px",borderTop:`1px solid ${C.border}`,borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
-                  <span style={{fontSize:9,color:C.textSub,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{videoFile.name}</span>
-                  <button style={{fontSize:9,color:C.accent,background:"none",border:"none",cursor:"pointer",flexShrink:0,padding:"2px 6px",marginLeft:4}} onClick={()=>{setVideoFile(null);videoFileRef.current=null;setVideoURL(null);setShots([]);setScenes([]);setPhase("idle");setVideoAspect(16/9);}}>✕</button>
+                <div style={{padding:"8px 16px",borderTop:`1px solid ${C.border}`,borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+                  <span style={{fontSize:11,color:C.textSub,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{videoFile.name}</span>
+                  <button style={{fontSize:12,color:C.accent,background:"none",border:"none",cursor:"pointer",flexShrink:0,padding:"2px 8px",marginLeft:8}} onClick={()=>{setVideoFile(null);videoFileRef.current=null;setVideoURL(null);setShots([]);setScenes([]);setPhase("idle");setVideoAspect(16/9);}}>✕ Remove</button>
                 </div>
               </>
             )}
 
-            <div style={{flex:1,overflow:"auto",padding:14,display:"flex",flexDirection:"column",gap:16}}>
+            {/* Controls */}
+            <div style={{flex:1,overflow:"auto",padding:20,display:"flex",flexDirection:"column",gap:20}}>
 
-              {/* Slider */}
+              {/* Shot detection */}
               <div>
-                <div style={{fontSize:9,letterSpacing:"0.15em",textTransform:"uppercase",color:C.textDim,marginBottom:10}}>Shot Detection</div>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:6,alignItems:"center"}}>
-                  <span style={{fontSize:9,color:C.textSub}}>Fewer</span>
-                  <span style={{fontSize:10,color:C.accent,fontWeight:700}}>{sliderLabel}</span>
-                  <span style={{fontSize:9,color:C.textSub}}>More</span>
+                <span style={label("Shot Detection")}>Shot Detection</span>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <span style={{fontSize:12,color:C.textSub}}>Fewer</span>
+                  <span style={{fontSize:13,color:C.accent,fontWeight:700}}>{sliderLabel}</span>
+                  <span style={{fontSize:12,color:C.textSub}}>More</span>
                 </div>
                 <input type="range" min={1} max={10} value={shotCount} step={1} onChange={e=>setShotCount(+e.target.value)} disabled={isRunning} />
-                <div style={{fontSize:9,color:C.textDim,textAlign:"center",marginTop:5}}>{sliderHint}</div>
+                <div style={{fontSize:11,color:C.textDim,textAlign:"center",marginTop:8,lineHeight:1.4}}>{sliderHint}</div>
               </div>
 
-              {/* Project */}
-              <div>
-                <div style={{fontSize:9,letterSpacing:"0.15em",textTransform:"uppercase",color:C.textDim,marginBottom:10}}>Project</div>
-                <div style={{display:"flex",flexDirection:"column",gap:7}}>
-                  {[["Creator / Project",creator,setCreator,"e.g. bgxfilms"],["Notes",notes,setNotes,"Optional…"]].map(([l,v,fn,ph])=>(
-                    <div key={l}>
-                      <label style={{fontSize:8,color:C.textDim,display:"block",marginBottom:3,letterSpacing:"0.08em",textTransform:"uppercase"}}>{l}</label>
-                      <input style={{width:"100%",background:C.surface2,border:`1px solid ${C.border2}`,borderRadius:3,padding:"6px 8px",fontFamily:"'Courier New',monospace",fontSize:10,color:C.text,outline:"none"}} value={v} onChange={e=>fn(e.target.value)} placeholder={ph} />
-                    </div>
-                  ))}
+              {/* Project info */}
+              <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                <span style={label("Project")}>Project</span>
+                <div>
+                  <label style={{fontSize:11,color:C.textDim,display:"block",marginBottom:6,letterSpacing:"0.06em",textTransform:"uppercase"}}>Creator / Project Name</label>
+                  <input style={fieldStyle} value={creator} onChange={e=>setCreator(e.target.value)} placeholder="e.g. bgxfilms" />
+                </div>
+                <div>
+                  <label style={{fontSize:11,color:C.textDim,display:"block",marginBottom:6,letterSpacing:"0.06em",textTransform:"uppercase"}}>Notes</label>
+                  <input style={fieldStyle} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Optional notes…" />
                 </div>
               </div>
 
               {/* Analyse button */}
-              <button className="hbtn" style={{width:"100%",padding:"11px",fontSize:10,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",borderRadius:4,border:"none",background:(!videoFile||isRunning)?"#161616":C.accent,color:(!videoFile||isRunning)?"#333":"#080808",cursor:(!videoFile||isRunning)?"not-allowed":"pointer"}} disabled={!videoFile||isRunning} onClick={run}>
-                {isRunning?(phase==="detecting"?"Scanning…":"Analysing…"):videoFile?"Detect + Analyse":"Upload Video First"}
+              <button className="hbtn" style={{width:"100%",padding:"14px",fontSize:13,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",borderRadius:6,border:"none",background:(!videoFile||isRunning)?"#1a1a1a":C.accent,color:(!videoFile||isRunning)?"#444":"#080808",cursor:(!videoFile||isRunning)?"not-allowed":"pointer"}} disabled={!videoFile||isRunning} onClick={run}>
+                {isRunning?(phase==="detecting"?"Scanning Video…":"Analysing Shots…"):videoFile?"Detect + Analyse":"Upload Video First"}
               </button>
 
               {/* Progress */}
-              {(isRunning||isDone)&&(
+              {(isRunning||isDone) && (
                 <div>
-                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
-                    <span style={{fontSize:8,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.1em"}}>{phase==="detecting"?"Scanning":phase==="analysing"?"Analysing":"Complete"}</span>
-                    <span style={{fontSize:8,color:isDone?C.green:C.accent}}>{progress}%</span>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                    <span style={{fontSize:11,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.08em"}}>{phase==="detecting"?"Scanning":phase==="analysing"?"Analysing":"Complete"}</span>
+                    <span style={{fontSize:11,color:isDone?C.green:C.accent,fontWeight:700}}>{progress}%</span>
                   </div>
-                  <div style={{height:2,background:C.border,borderRadius:1,overflow:"hidden",marginBottom:5}}>
+                  <div style={{height:3,background:C.border,borderRadius:2,overflow:"hidden",marginBottom:8}}>
                     <div style={{height:"100%",background:isDone?C.green:C.accent,transition:"width 0.3s",width:`${progress}%`}} />
                   </div>
-                  <div style={{fontSize:9,color:C.textDim}}>{statusMsg}</div>
+                  <div style={{fontSize:11,color:C.textDim,lineHeight:1.4}}>{statusMsg}</div>
                 </div>
               )}
 
               {/* Video upload progress */}
               {uploadProgress !== null && (
                 <div>
-                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
-                    <span style={{fontSize:8,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.1em"}}>Uploading Video</span>
-                    <span style={{fontSize:8,color:C.green}}>{uploadProgress}%</span>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                    <span style={{fontSize:11,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.08em"}}>Uploading Video</span>
+                    <span style={{fontSize:11,color:C.green,fontWeight:700}}>{uploadProgress}%</span>
                   </div>
-                  <div style={{height:2,background:C.border,borderRadius:1,overflow:"hidden"}}>
+                  <div style={{height:3,background:C.border,borderRadius:2,overflow:"hidden"}}>
                     <div style={{height:"100%",background:C.green,transition:"width 0.3s",width:`${uploadProgress}%`}} />
                   </div>
                 </div>
               )}
 
-              {/* Library save status */}
+              {/* Library status */}
               {libraryStatus && (
-                <div style={{fontSize:9,padding:"8px 10px",borderRadius:3,lineHeight:1.5,
+                <div style={{fontSize:12,padding:"10px 14px",borderRadius:6,lineHeight:1.5,
                   background:libraryStatus.type==="success"?C.greenDim:libraryStatus.type==="error"?"rgba(220,38,38,0.06)":C.accentDim,
                   color:libraryStatus.type==="success"?C.green:libraryStatus.type==="error"?C.red:C.accent,
                   border:`1px solid ${libraryStatus.type==="success"?C.greenBorder:libraryStatus.type==="error"?"rgba(220,38,38,0.2)":C.accentBorder}`}}>
@@ -464,16 +471,18 @@ export default function SceneDissect() {
                 </div>
               )}
 
-              {error && <div style={{fontSize:9,color:C.red,background:"rgba(220,38,38,0.06)",border:"1px solid rgba(220,38,38,0.15)",borderRadius:3,padding:"8px 10px",lineHeight:1.5}}>{error}</div>}
+              {error && (
+                <div style={{fontSize:12,color:C.red,background:"rgba(220,38,38,0.06)",border:"1px solid rgba(220,38,38,0.18)",borderRadius:6,padding:"10px 14px",lineHeight:1.5}}>{error}</div>
+              )}
             </div>
 
             {/* Scene strip */}
-            {scenes.length>0&&(
-              <div style={{borderTop:`1px solid ${C.border}`,padding:"8px 12px",flexShrink:0}}>
-                <div style={{fontSize:8,letterSpacing:"0.12em",textTransform:"uppercase",color:C.textDim,marginBottom:5}}>{scenes.length} Scenes</div>
-                <div style={{display:"flex",gap:2,overflowX:"auto",paddingBottom:2}}>
+            {scenes.length > 0 && (
+              <div style={{borderTop:`1px solid ${C.border}`,padding:"10px 16px",flexShrink:0}}>
+                <div style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",color:C.textDim,marginBottom:8}}>{scenes.length} Scenes Detected</div>
+                <div style={{display:"flex",gap:3,overflowX:"auto",paddingBottom:3}}>
                   {scenes.map((sc,i)=>(
-                    <div key={i} style={{flexShrink:0,width:isPortrait?18:32,height:22,borderRadius:2,overflow:"hidden",border:shots[i]?`1px solid ${C.accent}`:`1px solid ${C.border}`,background:"#000",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                    <div key={i} style={{flexShrink:0,width:isPortrait?22:38,height:26,borderRadius:3,overflow:"hidden",border:shots[i]?`1px solid ${C.accent}`:`1px solid ${C.border}`,background:"#000",display:"flex",alignItems:"center",justifyContent:"center"}}>
                       <img src={sc.dataUrl} alt="" style={{maxWidth:"100%",maxHeight:"100%",objectFit:"contain",display:"block"}} />
                     </div>
                   ))}
@@ -482,23 +491,23 @@ export default function SceneDissect() {
             )}
           </div>
 
-          {/* RIGHT — shot list */}
+          {/* ── RIGHT — shot list ── */}
           <div style={{flex:1,overflow:"auto",background:C.bg}}>
 
             {/* Sticky header */}
-            <div style={{padding:"10px 20px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,background:"rgba(7,7,7,0.96)",backdropFilter:"blur(8px)",zIndex:10,flexWrap:"wrap",gap:8}}>
-              <div style={{display:"flex",alignItems:"center",gap:10}}>
-                <span style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:shots.length?C.text:C.border2}}>{shots.length?"Shot List":"No Analysis Yet"}</span>
-                {shots.length>0&&<span style={{fontSize:9,color:C.accent,background:C.accentDim,border:`1px solid ${C.accentBorder}`,padding:"2px 8px",borderRadius:2}}>{shots.length} SHOTS</span>}
+            <div style={{padding:"12px 24px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,background:"rgba(7,7,7,0.96)",backdropFilter:"blur(8px)",zIndex:10,flexWrap:"wrap",gap:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:12}}>
+                <span style={{fontSize:13,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:shots.length?C.text:C.border2}}>{shots.length?"Shot List":"No Analysis Yet"}</span>
+                {shots.length>0 && <span style={{fontSize:11,color:C.accent,background:C.accentDim,border:`1px solid ${C.accentBorder}`,padding:"3px 10px",borderRadius:3}}>{shots.length} SHOTS</span>}
               </div>
 
               {isDone && shots.length>0 && (
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <span style={{fontSize:9,color:C.textDim}}>{selected.size} selected</span>
-                  <button className="hbtn" style={{fontSize:9,color:C.textSub,background:"none",border:`1px solid ${C.border2}`,borderRadius:3,padding:"4px 10px",letterSpacing:"0.06em"}} onClick={selectAll}>Select All</button>
-                  {selected.size>0&&<button className="hbtn" style={{fontSize:9,color:C.textDim,background:"none",border:`1px solid ${C.border2}`,borderRadius:3,padding:"4px 10px",letterSpacing:"0.06em"}} onClick={clearAll}>Clear</button>}
-                  {selected.size>0&&(
-                    <button className="hbtn" style={{fontSize:9,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:C.bg,background:C.green,border:"none",borderRadius:3,padding:"5px 14px",cursor:!token?"not-allowed":"pointer",opacity:!token?0.45:1}}
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <span style={{fontSize:11,color:C.textDim}}>{selected.size} selected</span>
+                  <button className="hbtn" style={{fontSize:11,color:C.textSub,background:"none",border:`1px solid ${C.border2}`,borderRadius:4,padding:"5px 12px"}} onClick={selectAll}>Select All</button>
+                  {selected.size>0 && <button className="hbtn" style={{fontSize:11,color:C.textDim,background:"none",border:`1px solid ${C.border2}`,borderRadius:4,padding:"5px 12px"}} onClick={clearAll}>Clear</button>}
+                  {selected.size>0 && (
+                    <button className="hbtn" style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase",color:C.bg,background:C.green,border:"none",borderRadius:4,padding:"7px 18px",cursor:!token?"not-allowed":"pointer",opacity:!token?0.45:1}}
                       onClick={saveToLibrary} disabled={!token}>
                       + Save to Library
                     </button>
@@ -506,68 +515,68 @@ export default function SceneDissect() {
                 </div>
               )}
 
-              {isRunning&&<div style={{display:"flex",alignItems:"center",gap:5}}>
-                {[0,1,2].map(i=><div key={i} style={{width:4,height:4,borderRadius:"50%",background:C.accent,animation:`pulse 1s ease-in-out ${i*0.15}s infinite`}} />)}
-                <span style={{fontSize:9,color:C.textDim,marginLeft:3}}>{statusMsg}</span>
-              </div>}
+              {isRunning && (
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  {[0,1,2].map(i=><div key={i} style={{width:5,height:5,borderRadius:"50%",background:C.accent,animation:`pulse 1s ease-in-out ${i*0.15}s infinite`}} />)}
+                  <span style={{fontSize:11,color:C.textDim,marginLeft:4}}>{statusMsg}</span>
+                </div>
+              )}
             </div>
 
             {/* Empty state */}
-            {!shots.length&&!isRunning&&(
-              <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"65%",gap:10}}>
-                <div style={{fontSize:40,opacity:0.1}}>🎬</div>
-                <div style={{fontSize:10,letterSpacing:"0.12em",textTransform:"uppercase",color:C.border2}}>Drop a video · Hit Detect + Analyse</div>
-                <div style={{fontSize:9,color:C.border2}}>Select cards and save to your Shot Library</div>
+            {!shots.length && !isRunning && (
+              <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"70%",gap:12}}>
+                <div style={{fontSize:48,opacity:0.08}}>🎬</div>
+                <div style={{fontSize:13,letterSpacing:"0.1em",textTransform:"uppercase",color:C.border2}}>Drop a video and hit Detect + Analyse</div>
+                <div style={{fontSize:11,color:C.border2}}>Click cards to select them · Save selected to your Shot Library</div>
               </div>
             )}
 
-            {/* Shot cards */}
-            <div style={{padding:"14px 20px",display:"flex",flexDirection:"column",gap:10}}>
+            {/* Cards */}
+            <div style={{padding:"16px 24px",display:"flex",flexDirection:"column",gap:12}}>
               {shots.map((shot,i)=>{
                 const isSel = selected.has(i);
                 return (
-                  <div key={i} className={`shot-card card-hover${isSel?" card-sel":""}`}
-                    style={{display:"grid",gridTemplateColumns:isPortrait?"110px 1fr":"200px 1fr",border:`1px solid ${isSel?C.accent:C.border}`,borderRadius:5,overflow:"hidden",background:isSel?"rgba(232,255,71,0.03)":C.surface,animationDelay:`${i*0.025}s`,cursor:"pointer",transition:"border-color 0.15s"}}
+                  <div key={i} className={`shot-card card-hover`}
+                    style={{display:"grid",gridTemplateColumns:isPortrait?"140px 1fr":"240px 1fr",border:`1.5px solid ${isSel?C.accent:C.border}`,borderRadius:8,overflow:"hidden",background:isSel?"rgba(232,255,71,0.03)":C.surface,animationDelay:`${i*0.025}s`,cursor:isDone?"pointer":"default",transition:"border-color 0.15s"}}
                     onClick={()=>isDone&&toggleCard(i)}>
 
-                    {/* Image */}
-                    <div style={{position:"relative",background:"#000",minHeight:isPortrait?170:130,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                    {/* Frame */}
+                    <div style={{position:"relative",background:"#000",minHeight:isPortrait?200:160,display:"flex",alignItems:"center",justifyContent:"center"}}>
                       <img src={shot.dataUrl} alt="" style={{maxWidth:"100%",maxHeight:"100%",objectFit:"contain",display:"block"}} />
-                      {/* Shot badge */}
-                      <div style={{position:"absolute",top:5,left:5,fontSize:8,letterSpacing:"0.1em",background:"rgba(0,0,0,0.88)",color:C.accent,padding:"2px 6px",borderRadius:2}}>
+                      <div style={{position:"absolute",top:7,left:7,fontSize:10,letterSpacing:"0.08em",background:"rgba(0,0,0,0.88)",color:C.accent,padding:"3px 8px",borderRadius:3}}>
                         {String(shot.shotNumber).padStart(2,"0")} · {shot.time?.toFixed(1)}s
                       </div>
-                      {/* Mood */}
-                      {shot.mood&&<div style={{position:"absolute",bottom:5,left:5,right:5,fontSize:8,letterSpacing:"0.06em",textTransform:"uppercase",background:"rgba(0,0,0,0.75)",color:C.text,padding:"2px 5px",borderRadius:2,textAlign:"center"}}>{shot.mood}</div>}
+                      {shot.mood && <div style={{position:"absolute",bottom:7,left:7,right:7,fontSize:10,letterSpacing:"0.05em",textTransform:"uppercase",background:"rgba(0,0,0,0.78)",color:C.text,padding:"3px 7px",borderRadius:3,textAlign:"center"}}>{shot.mood}</div>}
                       {/* Checkbox */}
-                      {isDone&&(
-                        <div className="card-check" style={{position:"absolute",top:5,right:5,width:18,height:18,borderRadius:3,border:`2px solid ${isSel?C.accent:"rgba(255,255,255,0.4)"}`,background:isSel?C.accent:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",opacity:isSel?1:0,transition:"all 0.15s"}}>
-                          {isSel&&<span style={{fontSize:10,color:"#000",fontWeight:700,lineHeight:1}}>✓</span>}
+                      {isDone && (
+                        <div className="chk-reveal" style={{position:"absolute",top:7,right:7,width:22,height:22,borderRadius:4,border:`2px solid ${isSel?C.accent:"rgba(255,255,255,0.5)"}`,background:isSel?C.accent:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",opacity:isSel?1:0,transition:"all 0.15s"}}>
+                          {isSel && <span style={{fontSize:12,color:"#000",fontWeight:700,lineHeight:1}}>✓</span>}
                         </div>
                       )}
                     </div>
 
                     {/* Data */}
-                    <div style={{padding:"11px 13px",display:"flex",flexDirection:"column",gap:9}}>
-                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                    <div style={{padding:"14px 16px",display:"flex",flexDirection:"column",gap:12}}>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
                         {[["Shot Type",shot.shotType],["Angle",shot.angle],["Movement",shot.cameraMovement],["Lens",shot.lensEstimate]].map(([k,v])=>(
                           <div key={k}>
-                            <div style={{fontSize:8,letterSpacing:"0.12em",textTransform:"uppercase",color:C.textDim,marginBottom:2}}>{k}</div>
-                            <div style={{fontSize:10,fontWeight:600,color:C.text,lineHeight:1.3}}>{v||"—"}</div>
+                            <div style={{fontSize:10,letterSpacing:"0.1em",textTransform:"uppercase",color:C.textDim,marginBottom:3}}>{k}</div>
+                            <div style={{fontSize:13,fontWeight:600,color:C.text,lineHeight:1.3}}>{v||"—"}</div>
                           </div>
                         ))}
                       </div>
-                      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8,display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:10,display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
                         {[["Lighting",shot.lighting],["Composition",shot.composition]].map(([k,v])=>(
                           <div key={k}>
-                            <div style={{fontSize:8,letterSpacing:"0.12em",textTransform:"uppercase",color:C.textDim,marginBottom:2}}>{k}</div>
-                            <div style={{fontSize:9,color:C.textSub,lineHeight:1.5}}>{v||"—"}</div>
+                            <div style={{fontSize:10,letterSpacing:"0.1em",textTransform:"uppercase",color:C.textDim,marginBottom:3}}>{k}</div>
+                            <div style={{fontSize:12,color:C.textSub,lineHeight:1.55}}>{v||"—"}</div>
                           </div>
                         ))}
                       </div>
-                      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8}}>
-                        <div style={{fontSize:8,letterSpacing:"0.12em",textTransform:"uppercase",color:C.accent,marginBottom:3}}>↳ Shoot For</div>
-                        <div style={{fontSize:9,color:C.textSub,lineHeight:1.6}}>{shot.shootFor||"—"}</div>
+                      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:10}}>
+                        <div style={{fontSize:10,letterSpacing:"0.1em",textTransform:"uppercase",color:C.accent,marginBottom:4}}>↳ Shoot For</div>
+                        <div style={{fontSize:12,color:C.textSub,lineHeight:1.6}}>{shot.shootFor||"—"}</div>
                       </div>
                     </div>
                   </div>
