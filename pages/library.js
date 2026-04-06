@@ -82,18 +82,23 @@ export default function Library() {
       const folders = foldersD.files || [];
       if (!folders.length) { setLoadStatus("No shotcards saved yet."); setLoading(false); return; }
 
-      const allCards = [];
-      for (const folder of folders) {
-        setLoadStatus(`Loading "${folder.name}"…`);
-        const jsonQ = encodeURIComponent(`mimeType='application/json' and '${folder.id}' in parents and trashed=false`);
-        const jsonD = await (await gFetch(`https://www.googleapis.com/drive/v3/files?q=${jsonQ}&fields=files(id,name)`)).json();
-        for (const file of (jsonD.files || [])) {
-          try {
-            const card = await (await gFetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`)).json();
-            allCards.push({ ...card, _fileId: file.id, _folderName: folder.name });
-          } catch(e) { console.warn("Failed:", file.name); }
-        }
-      }
+      // Fetch all folders in parallel for speed
+      setLoadStatus(`Loading ${folders.length} folder${folders.length!==1?"s":""}…`);
+      const folderResults = await Promise.all(folders.map(async (folder) => {
+        try {
+          const jsonQ = encodeURIComponent(`mimeType='application/json' and '${folder.id}' in parents and trashed=false`);
+          const jsonD = await (await gFetch(`https://www.googleapis.com/drive/v3/files?q=${jsonQ}&fields=files(id,name)`)).json();
+          // Fetch all cards in this folder in parallel
+          const cardResults = await Promise.all((jsonD.files || []).map(async (file) => {
+            try {
+              const card = await (await gFetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`)).json();
+              return { ...card, _fileId: file.id, _folderName: folder.name };
+            } catch(e) { return null; }
+          }));
+          return cardResults.filter(Boolean);
+        } catch(e) { return []; }
+      }));
+      const allCards = folderResults.flat();
       allCards.sort((a,b) => new Date(b.savedAt) - new Date(a.savedAt));
       setCards(allCards);
       setLoadStatus(`${allCards.length} card${allCards.length !== 1 ? "s" : ""} loaded`);
